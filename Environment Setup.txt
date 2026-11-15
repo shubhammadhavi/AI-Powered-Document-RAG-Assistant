@@ -1,0 +1,2 @@
+pip install fastapi uvicorn langchain langchain-openai langchain-chroma langchain-community langchain-text-splitters pypdf python-multipart
+export OPENAI_API_KEY="your-api-key-here"
