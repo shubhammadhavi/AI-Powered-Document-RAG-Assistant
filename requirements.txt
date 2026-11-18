@@ -1,0 +1,8 @@
+# Everything here is free, pure-wheel and installs without a compiler.
+fastapi>=0.110
+uvicorn>=0.27
+python-multipart>=0.0.9
+pypdf>=4.2
+numpy>=1.26
+scikit-learn>=1.4
+python-dotenv>=1.0

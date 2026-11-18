@@ -1,93 +1,151 @@
-import os
-import shutil
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from pydantic import BaseModel
-from langchain_community.document_loaders import PyPDFLoader, TextLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain_chroma import Chroma
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.runnables import RunnablePassthrough
-from langchain_core.output_parsers import StrOutputParser
+"""FastAPI layer for the Document RAG Assistant.
 
-app = FastAPI(title="AI-Powered Document RAG Assistant")
+Run it:  uvicorn main:app --reload
+Then open http://127.0.0.1:8000 in a browser.
 
-CHROMA_PATH = "./chroma_db"
-UPLOAD_DIR = "./uploaded_docs"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+Nothing here needs an API key. With no key configured the assistant answers by
+quoting the matching passages; add a free Gemini or Groq key (or run Ollama) and
+it writes proper answers instead. See README.md.
+"""
 
-embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
-vector_store = Chroma(
-    collection_name="technical_docs",
-    embedding_function=embeddings,
-    persist_directory=CHROMA_PATH
+from __future__ import annotations
+
+import re
+from pathlib import Path
+
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.responses import HTMLResponse, JSONResponse
+from pydantic import BaseModel, Field
+
+from app import config
+from app.engine import get_engine
+from app.loaders import EmptyDocument, UnsupportedFile
+
+app = FastAPI(
+    title="AI-Powered Document RAG Assistant",
+    description="Ask questions about your own PDFs, TXT and Markdown files. Runs free.",
+    version="2.0.0",
 )
 
+STATIC_DIR = Path(__file__).parent / "static"
+_SAFE_NAME = re.compile(r"[^A-Za-z0-9._ \-()]+")
+
+
 class QueryRequest(BaseModel):
-    question: str
-    top_k: int = 4
+    question: str = Field(..., min_length=1, examples=["How do I rotate the API keys?"])
+    top_k: int = Field(default=config.TOP_K, ge=1, le=20)
+
 
 class QueryResponse(BaseModel):
     answer: str
     sources: list[str]
+    provider: str
+    model: str
+    chunks: list[dict]
+
+
+def _safe_filename(name: str | None) -> str:
+    """Never trust an upload's filename: no paths, no surprises."""
+    candidate = Path(name or "").name.strip()
+    candidate = _SAFE_NAME.sub("_", candidate)
+    if not candidate or candidate.startswith("."):
+        raise HTTPException(status_code=400, detail="That file needs a normal file name.")
+    if Path(candidate).suffix.lower() not in config.ALLOWED_SUFFIXES:
+        raise HTTPException(
+            status_code=400,
+            detail="Only PDF, TXT and MD files are supported.",
+        )
+    return candidate
+
+
+@app.get("/", response_class=HTMLResponse, include_in_schema=False)
+def home() -> HTMLResponse:
+    index = STATIC_DIR / "index.html"
+    if not index.is_file():
+        return HTMLResponse(
+            "<h1>Document RAG Assistant</h1><p>UI file missing. "
+            'API docs are at <a href="/docs">/docs</a>.</p>'
+        )
+    return HTMLResponse(index.read_text(encoding="utf-8"))
+
+
+@app.get("/health")
+def health() -> dict:
+    return {"status": "ok"}
+
+
+@app.get("/status")
+def status() -> dict:
+    return get_engine().status()
+
 
 @app.post("/ingest")
-async def ingest_document(file: UploadFile = File(...)):
-    if not file.filename.endswith((".pdf", ".txt", ".md")):
-        raise HTTPException(status_code=400, detail="Only PDF, TXT, and MD files are supported.")
-    
-    file_path = os.path.join(UPLOAD_DIR, file.filename)
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+def ingest_document(file: UploadFile = File(...)) -> dict:
+    filename = _safe_filename(file.filename)
+    config.ensure_dirs()
+    destination = Path(config.UPLOAD_DIR) / filename
 
-    loader = PyPDFLoader(file_path) if file.filename.endswith(".pdf") else TextLoader(file_path)
-    raw_documents = loader.load()
+    limit = int(config.MAX_UPLOAD_MB * 1024 * 1024)
+    written = 0
+    with destination.open("wb") as buffer:
+        while True:
+            block = file.file.read(1024 * 1024)
+            if not block:
+                break
+            written += len(block)
+            if written > limit:
+                buffer.close()
+                destination.unlink(missing_ok=True)
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"File is larger than the {config.MAX_UPLOAD_MB:g} MB limit.",
+                )
+            buffer.write(block)
 
-    # Chunking strategy to preserve semantic context across boundaries
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=200,
-        separators=["\n\n", "\n", " ", ""]
-    )
-    chunks = text_splitter.split_documents(raw_documents)
-    vector_store.add_documents(chunks)
+    if written == 0:
+        destination.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="That file is empty.")
 
-    return {
-        "status": "success",
-        "filename": file.filename,
-        "chunks_indexed": len(chunks)
-    }
+    try:
+        result = get_engine().ingest_file(destination, source_name=filename)
+    except (UnsupportedFile, EmptyDocument) as exc:
+        destination.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return {"status": "success", **result}
+
 
 @app.post("/query", response_model=QueryResponse)
-async def query_documents(request: QueryRequest):
-    retriever = vector_store.as_retriever(search_kwargs={"k": request.top_k})
-    retrieved_docs = retriever.invoke(request.question)
+def query_documents(request: QueryRequest) -> QueryResponse:
+    try:
+        result = get_engine().ask(request.question, request.top_k)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return QueryResponse(**result.as_dict())
 
-    if not retrieved_docs:
-        return QueryResponse(
-            answer="No relevant documentation found to answer this question.",
-            sources=[]
-        )
 
-    # Strict system prompt to minimize LLM hallucinations
-    system_prompt = (
-        "You are a technical documentation assistant. Answer the user's question "
-        "strictly using the provided context below. If the answer cannot be found "
-        "in the context, state clearly that the provided documentation does not "
-        "contain the answer. Do not fabricate information.\n\n"
-        "Context:\n{context}"
-    )
+@app.get("/documents")
+def list_documents() -> dict:
+    documents = get_engine().documents()
+    return {
+        "count": len(documents),
+        "documents": [{"source": name, "chunks": n} for name, n in documents.items()],
+    }
 
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", system_prompt),
-        ("human", "{question}")
-    ])
 
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.0)
+@app.delete("/documents/{source}")
+def delete_document(source: str) -> dict:
+    removed = get_engine().delete(Path(source).name)
+    if not removed:
+        raise HTTPException(status_code=404, detail=f"No indexed document named {source!r}.")
+    return {"status": "deleted", "source": source, "chunks_removed": removed}
 
-    context_text = "\n\n---\n\n".join([doc.page_content for doc in retrieved_docs])
-    chain = prompt | llm | StrOutputParser()
-    answer = chain.invoke({"context": context_text, "question": request.question})
 
-    sources = list({doc.metadata.get("source", "unknown") for doc in retrieved_docs})
-    return QueryResponse(answer=answer, sources=sources)
+@app.post("/reset")
+def reset_index() -> dict:
+    return {"status": "cleared", "chunks_removed": get_engine().reset()}
+
+
+@app.exception_handler(Exception)
+def unhandled_error(_request, exc: Exception) -> JSONResponse:  # pragma: no cover
+    return JSONResponse(status_code=500, content={"detail": f"{type(exc).__name__}: {exc}"})

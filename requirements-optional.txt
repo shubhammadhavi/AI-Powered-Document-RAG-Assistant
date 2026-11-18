@@ -1,0 +1,4 @@
+# Optional upgrade: swaps TF-IDF retrieval for local semantic embeddings.
+# Free and offline after the first model download (~90 MB model, ~2 GB with torch).
+# After installing, set RAG_EMBEDDINGS=st in .env
+sentence-transformers>=2.7

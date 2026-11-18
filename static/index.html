@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Document RAG Assistant</title>
+<style>
+  :root {
+    --bg: #0f1117; --panel: #171a23; --panel-2: #1e222e; --line: #2a2f3d;
+    --text: #e7e9ee; --muted: #9aa3b5; --accent: #6ea8fe; --good: #5fd3a6; --warn: #e0b341;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text); font: 15px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  header { padding: 28px 24px 8px; max-width: 980px; margin: 0 auto; }
+  h1 { font-size: 22px; margin: 0 0 4px; letter-spacing: -0.2px; }
+  .sub { color: var(--muted); font-size: 13.5px; }
+  main { max-width: 980px; margin: 0 auto; padding: 16px 24px 64px; display: grid; gap: 18px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 18px; }
+  .card h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 0 0 12px; font-weight: 600; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; }
+  .drop {
+    border: 1.5px dashed var(--line); border-radius: 10px; padding: 22px; text-align: center;
+    color: var(--muted); cursor: pointer; transition: .15s; background: var(--panel-2);
+  }
+  .drop:hover, .drop.over { border-color: var(--accent); color: var(--text); }
+  input[type=text] {
+    flex: 1; min-width: 220px; background: var(--panel-2); border: 1px solid var(--line);
+    color: var(--text); padding: 11px 13px; border-radius: 9px; font-size: 15px;
+  }
+  input[type=text]:focus { outline: none; border-color: var(--accent); }
+  button {
+    background: var(--accent); color: #0b1020; border: 0; padding: 11px 18px; border-radius: 9px;
+    font-weight: 600; cursor: pointer; font-size: 14.5px;
+  }
+  button.ghost { background: transparent; color: var(--muted); border: 1px solid var(--line); }
+  button:disabled { opacity: .5; cursor: progress; }
+  .answer { white-space: pre-wrap; background: var(--panel-2); border: 1px solid var(--line); border-radius: 10px; padding: 16px; }
+  .sources { margin-top: 10px; font-size: 13px; color: var(--muted); }
+  .pill { display: inline-block; background: var(--panel-2); border: 1px solid var(--line); border-radius: 999px; padding: 3px 10px; margin: 3px 4px 0 0; font-size: 12.5px; }
+  .doc { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--line); font-size: 14px; }
+  .doc:last-child { border-bottom: 0; }
+  .doc small { color: var(--muted); }
+  .x { background: transparent; border: 0; color: var(--muted); cursor: pointer; font-size: 16px; padding: 2px 6px; }
+  .x:hover { color: #ff8080; }
+  footer { max-width: 980px; margin: 0 auto; padding: 0 24px 40px; color: var(--muted); font-size: 12.5px; }
+  .statusline { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12.5px; color: var(--muted); }
+  .dot { color: var(--good); }
+  details summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+  pre.chunk { white-space: pre-wrap; font-size: 12.5px; color: var(--muted); background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; padding: 10px; margin: 8px 0 0; }
+  .msg { font-size: 13px; margin-top: 8px; min-height: 18px; }
+  .msg.err { color: #ff9e9e; } .msg.ok { color: var(--good); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Document RAG Assistant</h1>
+  <div class="sub">Index your own PDFs, text and Markdown files, then ask questions grounded in them.</div>
+</header>
+
+<main>
+  <section class="card">
+    <h2>1 &middot; Add documents</h2>
+    <div id="drop" class="drop">
+      Drop a PDF, TXT or MD file here, or click to choose
+      <input id="file" type="file" accept=".pdf,.txt,.md,.markdown" multiple hidden />
+    </div>
+    <div id="upmsg" class="msg"></div>
+    <div id="docs"></div>
+  </section>
+
+  <section class="card">
+    <h2>2 &middot; Ask</h2>
+    <form id="qform" class="row">
+      <input id="q" type="text" placeholder="What does the document say about&hellip;" autocomplete="off" />
+      <button id="askbtn" type="submit">Ask</button>
+      <button type="button" class="ghost" id="resetbtn">Clear index</button>
+    </form>
+    <div id="qmsg" class="msg"></div>
+    <div id="result" hidden>
+      <div id="answer" class="answer"></div>
+      <div id="sources" class="sources"></div>
+      <details id="ctx"><summary>Retrieved passages</summary><div id="chunks"></div></details>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Setup</h2>
+    <div id="status" class="statusline">loading&hellip;</div>
+  </section>
+</main>
+
+<footer>
+  No paid services. Retrieval runs locally; answers come from a free model if one is configured,
+  otherwise the matching passages are quoted directly. API reference at <a href="/docs">/docs</a>.
+</footer>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+function say(el, text, kind) { el.textContent = text; el.className = 'msg' + (kind ? ' ' + kind : ''); }
+
+async function api(path, options) {
+  const response = await fetch(path, options);
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(body.detail || ('HTTP ' + response.status));
+  return body;
+}
+
+async function loadStatus() {
+  try {
+    const s = await api('/status');
+    $('status').innerHTML =
+      `<span><span class="dot">&#9679;</span> retrieval: ${esc(s.retriever_detail || s.retriever)}</span>` +
+      `<span><span class="dot">&#9679;</span> answers: ${esc(s.llm_provider)}${s.llm_model && s.llm_model !== 'auto' ? ' / ' + esc(s.llm_model) : ''}</span>` +
+      `<span>cost: ${esc(s.paid_services_used)}</span>` +
+      `<span>${s.documents} document(s), ${s.chunks} chunk(s)</span>`;
+  } catch (e) { $('status').textContent = 'status unavailable: ' + e.message; }
+}
+
+async function loadDocs() {
+  const { documents } = await api('/documents');
+  $('docs').innerHTML = documents.length ? documents.map(d =>
+    `<div class="doc"><span>${esc(d.source)} <small>&middot; ${d.chunks} chunks</small></span>
+     <button class="x" data-del="${esc(d.source)}" title="Remove">&times;</button></div>`).join('') : '';
+  $('docs').querySelectorAll('[data-del]').forEach(b => b.onclick = async () => {
+    await api('/documents/' + encodeURIComponent(b.dataset.del), { method: 'DELETE' });
+    await refresh();
+  });
+}
+
+const refresh = () => Promise.all([loadDocs(), loadStatus()]);
+
+async function upload(files) {
+  for (const file of files) {
+    say($('upmsg'), 'Indexing ' + file.name + '…');
+    const form = new FormData();
+    form.append('file', file);
+    try {
+      const r = await api('/ingest', { method: 'POST', body: form });
+      say($('upmsg'), `${r.source}: ${r.chunks_indexed} chunks indexed` + (r.replaced ? ` (replaced ${r.replaced})` : ''), 'ok');
+    } catch (e) { say($('upmsg'), file.name + ': ' + e.message, 'err'); }
+  }
+  await refresh();
+}
+
+$('drop').onclick = () => $('file').click();
+$('file').onchange = (e) => upload(e.target.files);
+['dragover', 'dragenter'].forEach(ev => $('drop').addEventListener(ev, e => { e.preventDefault(); $('drop').classList.add('over'); }));
+['dragleave', 'drop'].forEach(ev => $('drop').addEventListener(ev, e => { e.preventDefault(); $('drop').classList.remove('over'); }));
+$('drop').addEventListener('drop', e => upload(e.dataTransfer.files));
+
+$('qform').onsubmit = async (e) => {
+  e.preventDefault();
+  const question = $('q').value.trim();
+  if (!question) return;
+  $('askbtn').disabled = true;
+  say($('qmsg'), 'Thinking…');
+  try {
+    const r = await api('/query', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ question })
+    });
+    $('result').hidden = false;
+    $('answer').textContent = r.answer;
+    $('sources').innerHTML = r.sources.length
+      ? 'Sources: ' + r.sources.map(s => `<span class="pill">${esc(s)}</span>`).join('')
+      : '';
+    $('ctx').hidden = !r.chunks.length;
+    $('chunks').innerHTML = r.chunks.map(c =>
+      `<pre class="chunk">[${esc(c.source)} p.${c.page} &middot; score ${c.score}]\n${esc(c.preview)}…</pre>`).join('');
+    say($('qmsg'), `answered by ${r.provider}${r.model && r.model !== 'none' && r.model !== '-' ? ' (' + r.model + ')' : ''}`);
+  } catch (e) { say($('qmsg'), e.message, 'err'); }
+  $('askbtn').disabled = false;
+};
+
+$('resetbtn').onclick = async () => {
+  if (!confirm('Remove every indexed document?')) return;
+  await api('/reset', { method: 'POST' });
+  $('result').hidden = true;
+  say($('upmsg'), 'Index cleared', 'ok');
+  await refresh();
+};
+
+refresh();
+</script>
+</body>
+</html>
